@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::dom::activation::{synthetic_click_activation, Activatable, ActivationSource};
+use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -10,11 +10,10 @@ use crate::dom::bindings::codegen::Bindings::FileListBinding::FileListMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLFormElementBinding::SelectionMode;
 use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding;
 use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
-use crate::dom::bindings::codegen::Bindings::KeyboardEventBinding::KeyboardEventMethods;
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomObject;
-use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
+use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::compositionevent::CompositionEvent;
 use crate::dom::document::Document;
@@ -228,7 +227,6 @@ pub struct HTMLInputElement {
     minlength: Cell<i32>,
     #[ignore_malloc_size_of = "#7193"]
     textinput: DomRefCell<TextInput<ScriptToConstellationChan>>,
-    activation_state: DomRefCell<InputActivationState>,
     // https://html.spec.whatwg.org/multipage/#concept-input-value-dirty-flag
     value_dirty: Cell<bool>,
 
@@ -238,30 +236,13 @@ pub struct HTMLInputElement {
 }
 
 #[derive(JSTraceable)]
-#[unrooted_must_root_lint::must_root]
-#[derive(MallocSizeOf)]
-struct InputActivationState {
+pub struct InputActivationState {
     indeterminate: bool,
     checked: bool,
-    checked_changed: bool,
-    checked_radio: Option<Dom<HTMLInputElement>>,
-    // In case mutability changed
-    was_mutable: bool,
+    checked_radio: Option<DomRoot<HTMLInputElement>>,
     // In case the type changed
     old_type: InputType,
-}
-
-impl InputActivationState {
-    fn new() -> InputActivationState {
-        InputActivationState {
-            indeterminate: false,
-            checked: false,
-            checked_changed: false,
-            checked_radio: None,
-            was_mutable: false,
-            old_type: Default::default(),
-        }
-    }
+    // was_mutable is implied: pre-activation would return None if it wasn't
 }
 
 static DEFAULT_INPUT_SIZE: u32 = 20;
@@ -300,7 +281,6 @@ impl HTMLInputElement {
                 None,
                 SelectionDirection::None,
             )),
-            activation_state: DomRefCell::new(InputActivationState::new()),
             value_dirty: Cell::new(false),
             filelist: MutNullableDom::new(None),
             form_owner: Default::default(),
@@ -1259,7 +1239,7 @@ impl HTMLInputElement {
 
     // https://html.spec.whatwg.org/multipage/#implicit-submission
     #[allow(unsafe_code)]
-    fn implicit_submission(&self, ctrl_key: bool, shift_key: bool, alt_key: bool, meta_key: bool) {
+    fn implicit_submission(&self) {
         let doc = document_from_node(self);
         let node = doc.upcast::<Node>();
         let owner = self.form_owner();
@@ -1280,14 +1260,11 @@ impl HTMLInputElement {
         match submit_button {
             Some(ref button) => {
                 if button.is_instance_activatable() {
-                    synthetic_click_activation(
-                        button.as_element(),
-                        ctrl_key,
-                        shift_key,
-                        alt_key,
-                        meta_key,
-                        ActivationSource::NotFromClick,
-                    )
+                    // spec does not actually say to set the not trusted flag,
+                    // but we can get here from synthetic keydown events
+                    button
+                        .upcast::<Node>()
+                        .fire_synthetic_mouse_event_not_trusted(DOMString::from("click"));
                 }
             },
             None => {
@@ -1610,12 +1587,7 @@ impl VirtualMethods for HTMLInputElement {
                 let action = self.textinput.borrow_mut().handle_keydown(keyevent);
                 match action {
                     TriggerDefaultAction => {
-                        self.implicit_submission(
-                            keyevent.CtrlKey(),
-                            keyevent.ShiftKey(),
-                            keyevent.AltKey(),
-                            keyevent.MetaKey(),
-                        );
+                        self.implicit_submission();
                     },
                     DispatchInput => {
                         self.value_dirty.set(true);
@@ -1733,99 +1705,96 @@ impl Activatable for HTMLInputElement {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#run-pre-click-activation-steps
-    #[allow(unsafe_code)]
-    fn pre_click_activation(&self) {
-        let mut cache = self.activation_state.borrow_mut();
-        let ty = self.input_type();
-        cache.old_type = ty;
-        cache.was_mutable = self.is_mutable();
-        if cache.was_mutable {
-            match ty {
-                // https://html.spec.whatwg.org/multipage/#submit-button-state-(type=submit):activation-behavior
-                // InputType::Submit => (), // No behavior defined
-                // https://html.spec.whatwg.org/multipage/#reset-button-state-(type=reset):activation-behavior
-                // InputType::Submit => (), // No behavior defined
-                InputType::Checkbox => {
-                    /*
-                    https://html.spec.whatwg.org/multipage/#checkbox-state-(type=checkbox):pre-click-activation-steps
-                    cache current values of `checked` and `indeterminate`
-                    we may need to restore them later
-                    */
-                    cache.indeterminate = self.Indeterminate();
-                    cache.checked = self.Checked();
-                    cache.checked_changed = self.checked_changed.get();
-                    self.SetIndeterminate(false);
-                    self.SetChecked(!cache.checked);
-                },
-                // https://html.spec.whatwg.org/multipage/#radio-button-state-(type=radio):pre-click-activation-steps
-                InputType::Radio => {
-                    //TODO: if not in document, use root ancestor instead of document
-                    let owner = self.form_owner();
-                    let doc = document_from_node(self);
-                    let doc_node = doc.upcast::<Node>();
-                    let group = self.radio_group_name();
-
-                    // Safe since we only manipulate the DOM tree after finding an element
-                    let checked_member = doc_node
-                        .query_selector_iter(DOMString::from("input[type=radio]"))
-                        .unwrap()
-                        .filter_map(DomRoot::downcast::<HTMLInputElement>)
-                        .find(|r| {
-                            in_same_group(&*r, owner.as_deref(), group.as_ref()) && r.Checked()
-                        });
-                    cache.checked_radio = checked_member.as_deref().map(Dom::from_ref);
-                    cache.checked_changed = self.checked_changed.get();
-                    self.SetChecked(true);
-                },
-                _ => (),
-            }
+    // https://dom.spec.whatwg.org/multipage/#eventtarget-legacy-pre-activation-behavior
+    fn legacy_pre_activation_behavior(&self) -> Option<InputActivationState> {
+        if !self.is_mutable() {
+            return None;
         }
+
+        let ty = self.input_type();
+        match ty {
+            InputType::Checkbox => {
+                let was_checked = self.Checked();
+                let was_indeterminate = self.Indeterminate();
+                self.SetIndeterminate(false);
+                self.SetChecked(!was_checked);
+                return Some(InputActivationState {
+                    checked: was_checked,
+                    indeterminate: was_indeterminate,
+                    checked_radio: None,
+                    old_type: InputType::Checkbox,
+                });
+            },
+            InputType::Radio => {
+                //TODO: if not in document, use root ancestor instead of document
+                let owner = self.form_owner();
+                let doc = document_from_node(self);
+                let doc_node = doc.upcast::<Node>();
+                let group = self.radio_group_name();
+
+                // Safe since we only manipulate the DOM tree after finding an element
+                let checked_member = doc_node
+                    .query_selector_iter(DOMString::from("input[type=radio]"))
+                    .unwrap()
+                    .filter_map(DomRoot::downcast::<HTMLInputElement>)
+                    .find(|r| in_same_group(&*r, owner.as_deref(), group.as_ref()) && r.Checked());
+                let was_checked = self.Checked();
+                self.SetChecked(true);
+                return Some(InputActivationState {
+                    checked: was_checked,
+                    indeterminate: false,
+                    checked_radio: checked_member.as_deref().map(DomRoot::from_ref),
+                    old_type: InputType::Radio,
+                });
+            },
+            _ => (),
+        }
+        return None;
     }
 
-    // https://html.spec.whatwg.org/multipage/#run-canceled-activation-steps
-    fn canceled_activation(&self) {
-        let cache = self.activation_state.borrow();
-        let ty = self.input_type();
-        if cache.old_type != ty {
-            // Type changed, abandon ship
-            // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27414
+    // https://dom.spec.whatwg.org/multipage/#eventtarget-legacy-canceled-activation-behavior
+    fn legacy_canceled_activation_behavior(&self, cache: Option<InputActivationState>) {
+        // Step 1
+        if !self.is_mutable() {
             return;
         }
-        match ty {
-            // https://html.spec.whatwg.org/multipage/#submit-button-state-(type=submit):activation-behavior
-            // InputType::Submit => (), // No behavior defined
-            // https://html.spec.whatwg.org/multipage/#reset-button-state-(type=reset):activation-behavior
-            // InputType::Reset => (), // No behavior defined
-            // https://html.spec.whatwg.org/multipage/#checkbox-state-(type=checkbox):canceled-activation-steps
-            InputType::Checkbox => {
-                // We want to restore state only if the element had been changed in the first place
-                if cache.was_mutable {
-                    self.SetIndeterminate(cache.indeterminate);
-                    self.SetChecked(cache.checked);
-                    self.checked_changed.set(cache.checked_changed);
+        let ty = self.input_type();
+        let cache = match cache {
+            Some(cache) => {
+                if cache.old_type != ty {
+                    // Type changed, abandon ship
+                    // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27414
+                    return;
                 }
+                cache
             },
-            // https://html.spec.whatwg.org/multipage/#radio-button-state-(type=radio):canceled-activation-steps
+            None => {
+                return;
+            },
+        };
+
+        match ty {
+            // Step 2
+            InputType::Checkbox => {
+                self.SetIndeterminate(cache.indeterminate);
+                self.SetChecked(cache.checked);
+            },
+            // Step 3
             InputType::Radio => {
-                // We want to restore state only if the element had been changed in the first place
-                if cache.was_mutable {
-                    if let Some(ref o) = cache.checked_radio {
-                        // Avoiding iterating through the whole tree here, instead
-                        // we can check if the conditions for radio group siblings apply
-                        if in_same_group(
-                            &o,
-                            self.form_owner().as_deref(),
-                            self.radio_group_name().as_ref(),
-                        ) {
-                            o.SetChecked(true);
-                        } else {
-                            self.SetChecked(false);
-                        }
+                if let Some(ref o) = cache.checked_radio {
+                    // Avoiding iterating through the whole tree here, instead
+                    // we can check if the conditions for radio group siblings apply
+                    if in_same_group(
+                        &o,
+                        self.form_owner().as_deref(),
+                        self.radio_group_name().as_ref(),
+                    ) {
+                        o.SetChecked(true);
                     } else {
                         self.SetChecked(false);
                     }
-                    self.checked_changed.set(cache.checked_changed);
+                } else {
+                    self.SetChecked(false);
                 }
             },
             _ => (),
@@ -1835,11 +1804,6 @@ impl Activatable for HTMLInputElement {
     // https://html.spec.whatwg.org/multipage/#run-post-click-activation-steps
     fn activation_behavior(&self, _event: &Event, _target: &EventTarget) {
         let ty = self.input_type();
-        if self.activation_state.borrow().old_type != ty || !self.is_mutable() {
-            // Type changed or input is immutable, abandon ship
-            // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27414
-            return;
-        }
         match ty {
             InputType::Submit => {
                 // https://html.spec.whatwg.org/multipage/#submit-button-state-(type=submit):activation-behavior
